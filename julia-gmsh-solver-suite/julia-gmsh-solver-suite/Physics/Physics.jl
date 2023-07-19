@@ -1,0 +1,23 @@
+module Physics
+
+include("AbstractPhysics.jl")
+
+export FieldType
+export ProblemType
+export AbstractConstitutives, AbstratElementConstitutives, AbstractNodalConstitutives
+export AbstractBoundaryCondition, ImpedanceBoundaryCondition, DirichletBoundaryCondition, NeumannBoundaryCondition, RobinBoundaryCondtion
+
+include("EMPhysics.jl")
+
+export c0, ε0, μ0, Z0, Y0
+export AbstractProblemType, EMTMProblemType, EMTEProblemType, EM3DProblemType
+export ElectricField, MagneticField
+export AbstractEMConstitutives, AbstractEMElementConstitutives, AbstractEMNodalConstitutives
+export SimpleRealEMConstitutives
+export SimpleComplexEMConstitutives
+export ComplexEMElementConstitutives
+export AbstractEMBoundaryCondition, AbstractEMElementBoundaryCondition
+export PECEMBoundaryCondition, PMCEMBoundaryCondition, IMPEMBoundaryCondition, ABCEMBoundaryCondition
+export EMElementBoundaryCondition
+
+end

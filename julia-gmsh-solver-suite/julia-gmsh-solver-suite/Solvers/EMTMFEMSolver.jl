@@ -1,0 +1,393 @@
+using LinearAlgebra
+using StaticArrays
+using Plots
+
+#=------------------------------------
+Element Matrices Struct
+-------------------------------------=#
+
+struct EMTMElementVolumeMatrices <: AbstractElementVolumeMatrices
+    B::Array{Float64,3}                     #nbasis x nquad_points x nelements
+    M::Array{Float64,3}                     #nbasis x nbasis x nelements
+    Sx::Array{Float64,3}                    #nbasis x nbasis x nelements
+    Sy::Array{Float64,3}                    #nbasis x nbasis x nelements
+end
+
+struct EMTMBoundaryFluxMatrices <: AbstractBoundaryFluxMatrices
+    F_minus::Array{Complex{Float64},3}
+    ele_indexes::Vector{Int64}
+    #Fplus::Array{Float64,3}
+    #Frhs::Array{Float64,3}
+end
+
+
+function elementVolumeMatrices(problem_type::EMTMProblemType, space::SimpleFiniteElementSpace{HOneTriangle})
+    
+    local_functions = space.local_space.functions[1,:,:,:] #only one component for scalar functions
+    gradient_functions = space.local_space.gradient_functions
+    (_, num_functions, num_points, num_orientations) = size(gradient_functions)
+
+    # convert to arrays of SVector
+    gradient_functions = reinterpret(SVector{3,Float64}, gradient_functions)
+    gradient_functions = reshape(gradient_functions, (num_functions, num_points, num_orientations))
+
+    # get quad points and weights
+    quad_weights = space.local_space.quad_weights
+    quad_points = space.local_space.quad_points
+    num_quad_points = length(quad_weights)
+    #println("Num points = ", num_points, " num quad points = ", num_quad_points)
+    @assert(num_points == num_quad_points)
+
+    # storage for M and S
+    B = zeros(num_functions, num_quad_points, length(space.mesh.elements.tags))
+    M = zeros(num_functions, num_functions, length(space.mesh.elements.tags))
+    Sx = zeros(num_functions, num_functions, length(space.mesh.elements.tags))
+    Sy = zeros(num_functions, num_functions, length(space.mesh.elements.tags))
+
+    #dBx, dBy, dBz #these would be useful
+
+    # temporary arrays
+    basis_functions = zeros(Float64, num_points, num_functions)
+    gradient_basis_functions = zeros(SVector{3,Float64}, num_points, num_functions)
+
+    for (t, tag) in enumerate(space.mesh.elements.tags)
+        # get orientation for this element
+        orient = 1 + gmsh.model.mesh.getBasisFunctionsOrientationForElement(tag, "Lagrange")
+
+        # get jacobians for this element, convert to SMatrix
+        jacobians, determinants, _ = gmsh.model.mesh.getJacobian(tag, quad_points)
+        jacobians = reinterpret(SMatrix{3,3,Float64,9}, jacobians)
+
+        for i = 1:num_points, f = 1:num_functions
+            basis_functions[i, f] = local_functions[f, i, orient] # not fantastic for efficiency but done for now to be consistent with HCurl formulations. orient should be 1 and there is nothing to do for the value of the basis function
+            gradient_basis_functions[i, f] = jacobians[i]' \ gradient_functions[f, i, orient]
+        end
+
+        for q = 1:num_quad_points, i = 1:num_functions
+            B[i, q, t] = basis_functions[q,i]*determinants[q]*quad_weights[q]
+        end
+
+        for j = 1:num_functions, i = 1:num_functions
+            tempM = 0
+            tempSx = 0
+            tempSy = 0
+
+            for q = 1:num_points
+                # brackets on inner product of functions required to get exact symmetry
+                tempM += quad_weights[q] * (basis_functions[q, i]' * basis_functions[q, j]) * determinants[q]
+                tempSx += quad_weights[q] * (gradient_basis_functions[q, i][1] * gradient_basis_functions[q, j][1]) * determinants[q]
+                tempSy += quad_weights[q] * (gradient_basis_functions[q, i][2] * gradient_basis_functions[q, j][2]) * determinants[q]
+            
+            end
+
+            M[i, j, t] = tempM
+            Sx[i, j, t] = tempSx
+            Sy[i, j, t] = tempSy
+        
+        end
+    end
+
+    element_matrices = EMTMElementVolumeMatrices(B, M, Sx, Sy)
+    return element_matrices
+end
+#=
+function elementFluxMatrices(problem_type::EMTMProblemType, space::SimpleFiniteElementSpace{HOneTriangle}), boundary_conditions::Vector{EMElementBoundaryCondition}, constitutives::ComplexElementConstitutives, frequency::Float64)
+
+    # Note: this function is currently written assuming element type triangle0 - it may or may not work otherwise
+    
+    # get basic setup information
+    element_type = basis.element_type
+    integration_order = basis.intergration_order
+
+    # # get edges 
+    # edge_nodes = convert.(Int64,gmsh.model.mesh.getElementEdgeNodes(element_type))   
+    # element_edge_tags, _ = gmsh.model.mesh.getEdges(edge_nodes)   # 3 * number of elements for triangles
+
+    # # create gmsh elements for edges (this could be unified in one)
+    # new_mesh_entity = gmsh.model.addDiscreteEntity(1) #add a 1D mesh entity for the 1D edge elements
+    # line_element_tag_offset = gmsh.model.mesh.getMaxElementTag() # new element tags (which are unique in the mesh) must be offset from existing tags
+    
+    # unique_line_tags = Set()    # keep track of added lines
+    # tags_for_lines = []         # list of new line tags
+    # nodes_for_lines = []        # list of nodes for lines
+    
+    
+
+    # # loop over element edges to create a unique set of edges to add as lines
+    # for iedge in eachindex(element_edge_tags)  
+    #     if !(in(element_edge_tags[iedge] , unique_line_tags))   # if we haven't added this line yet
+    #         push!(unique_line_tags, element_edge_tags[iedge])   # add the line tag to the set 
+    #         push!(tags_for_lines, element_edge_tags[iedge] + line_element_tag_offset) # add the line tag to the list, offset appropriately
+    #         append!(nodes_for_lines, edge_nodes[2*(iedge-1) .+ (1:2)]) # add the node indexes in the mesh that make up the line    
+    #     end
+    # end
+
+    line_type = gmsh.model.mesh.getElementType("line",1)
+    # # add the edges as line elements
+    # gmsh.model.mesh.addElementsByType(new_mesh_entity, line_type, tags_for_lines, nodes_for_lines)
+    
+    # get a local integration rule on line elements for evaluating integrals
+    
+    line_quad_rule = gmsh.model.mesh.getIntegrationPoints(line_type,"Gauss$integration_order")
+    line_n_quad_points = length(line_quad_rule[1]) ÷ 3
+    line_quad_points = line_quad_rule[1]
+    line_quad_coordinate = 0.5 .* (line_quad_points[1:3:end] .+ 1) #only the first coordinate matters
+    line_quad_weights = line_quad_rule[2]
+
+    # smesh_perimeter = 0
+
+    W = diagm(line_quad_weights)
+    nxdBx = Array{Complex{Float64}, 2}(undef, basis.n_basis, line_n_quad_points) #derivative of basis in x
+    nydBy = Array{Complex{Float64}, 2}(undef, basis.n_basis, line_n_quad_points) #derivative of basis in y
+    dBx = Array{Complex{Float64}, 2}(undef, basis.n_basis, line_n_quad_points) #derivative of basis in x
+    dBy = Array{Complex{Float64}, 2}(undef, basis.n_basis, line_n_quad_points) #derivative of basis in y
+    
+    nxnxE = Array{Complex{Float64}, 2}(undef, basis.n_basis, line_n_quad_points)
+    F = Array{Complex{Float64}, 3}(undef,  basis.n_basis, basis.n_basis, length(boundary_conditions)) #nbasis x nbasis x nelements
+    F2 = Array{Complex{Float64}, 3}(undef,  basis.n_basis, basis.n_basis, length(boundary_conditions)) #nbasis x nbasis x nelements
+    ele_indexes = Vector{Int64}(undef, length(boundary_conditions))
+    # process boundary conditions
+
+    nxvec = Vector{Float64}(undef,0)
+    nyvec = Vector{Float64}(undef,0)
+    xvec = Vector{Float64}(undef,0)
+    yvec = Vector{Float64}(undef,0)
+
+    for ibd in eachindex(boundary_conditions)
+        
+        boundary = boundary_conditions[ibd]
+
+        # get element properties (tag, index, face) from boundary -- TODO: check if this will properly support PEC/PMC sheets (internal boundaries)
+        element_tag = boundary.ele_tag
+        element_index = boundary.ele_index
+        element_face_index = boundary.ele_face_index
+        boundary_type = boundary.boundary_type
+        boundary_tag = boundary.boundary_tag 
+
+        # map line quadrature points to points inside the element -- this mapping is element dependent
+        # and a triangle is assumed here
+        if element_face_index == 1
+            element_edge_quad_points = hcat(line_quad_coordinate, 0*line_quad_coordinate, 0*line_quad_coordinate)' # edge 1 = (u, 0)
+        elseif element_face_index == 2
+            element_edge_quad_points = hcat(line_quad_coordinate, 1 .- line_quad_coordinate, 0*line_quad_coordinate)' # edge 2 = (u, 1-u)
+        elseif element_face_index == 3
+            element_edge_quad_points = hcat(0*line_quad_coordinate, line_quad_coordinate, 0* line_quad_coordinate)' #edge 3 = (0,v)
+            @assert(false,"Unexpected face index")
+        else
+            @assert(false,"Unexpected face index")
+        end
+        
+        # #*** this doesn't work...
+        # edge_tag = element_edge_tags[3*(boundary_element_index-1) + boundary_element_face_index]
+        # line_tag = edge_tag + line_element_tag_offset
+
+        # get the 1d line jacobian
+        line_jacobian, line_determinant, line_global_edge_points = gmsh.model.mesh.getJacobian(boundary_tag, line_quad_points[:])
+        line_jacobian = reshape(line_jacobian, 3, 3, line_n_quad_points)
+
+        # mesh_perimeter = mesh_perimeter + sum(line_determinant .* line_quad_weights)
+
+        # get the 2d element jacobian
+        ele_jacobian, _, ele_global_edge_points = gmsh.model.mesh.getJacobian(element_tag, element_edge_quad_points[:])
+        ele_jacobian = reshape(ele_jacobian, 3, 3, line_n_quad_points)
+
+        @assert(norm(ele_global_edge_points - line_global_edge_points) < 1e-12)
+
+        # get the outward normal to the boundary
+        surface_normal = ele_jacobian[:,3,:]
+        edge_tangent = line_jacobian[:,1,:] # this is +/- 1*element edge vector but we will adjust
+
+        # calculate edge normal at each point along the edge
+        nhat = [cross(edge_tangent[:,ipoint], surface_normal[:,ipoint]) for ipoint in 1:line_n_quad_points]
+        nhat = [nhat[ipoint]/norm(nhat[ipoint]) for ipoint in 1:line_n_quad_points]
+
+        for ipoint in eachindex(nhat)
+
+            push!(nxvec, nhat[ipoint][1])
+            push!(nyvec, nhat[ipoint][2])
+            push!(xvec, ele_global_edge_points[3*(ipoint-1) + 1])
+            push!(yvec, ele_global_edge_points[3*(ipoint-1) + 2])
+
+        end
+
+
+        # orient edge normal outwards
+        _, _, ele_centroid = gmsh.model.mesh.getJacobian(element_tag, [1/3, 1/3, 0])
+        ele_centroid_to_edge = ele_global_edge_points[1:3] - ele_centroid #just take the first point arbitrarily
+        mesh_centroid_to_edge = ele_global_edge_points[1:3]/norm(ele_global_edge_points[1:3]) #not quite but close
+        for ipoint in 1:line_n_quad_points
+            if dot(ele_centroid_to_edge, nhat[ipoint]) < 0 # change projection if negative dot product
+                nhat[ipoint] = nhat[ipoint] .* -1
+            end
+            # proj = dot(mesh_centroid_to_edge, nhat[ipoint])
+            # println("Projection = ", proj)
+        end
+
+
+        # basis functions along the boundary
+        n_comp_basis::Int64, basis_on_surface, n_orient::Int64 = gmsh.model.mesh.getBasisFunctions(element_type, element_edge_quad_points[:], basis.name)
+        n_basis_on_surface = (((length(basis_on_surface) ÷ n_comp_basis) ÷ line_n_quad_points) ÷ n_orient)
+        basis_on_surface = reshape(basis_on_surface, n_comp_basis, n_basis_on_surface, line_n_quad_points, n_orient)
+        B = basis_on_surface[1,:,:,1]
+
+        # gradient of basis functions along the surface
+        n_comp_grad_basis::Int64, grad_basis_on_surface, n_orient_grad::Int64 = gmsh.model.mesh.getBasisFunctions(element_type, element_edge_quad_points[:], string("Grad",basis.name)) 
+        grad_basis_on_surface = reshape(grad_basis_on_surface, n_comp_grad_basis, n_basis_on_surface, line_n_quad_points, n_orient_grad)
+        
+
+        #------------------------------------------------
+        # Pull out constitutives at points along the edge
+        #------------------------------------------------
+
+        α = 1 # upwind parameter
+        ω = 2*π*frequency
+        ε_minus = [constitutives.element_ε_r[element_index]*ε0 for ipoint in 1:line_n_quad_points]
+        μ_minus = [constitutives.element_μ_r[element_index]*μ0 for ipoint in 1:line_n_quad_points]
+        Z_minus = [sqrt(μ_minus[ipoint]/ε_minus[ipoint]) for ipoint in 1:line_n_quad_points]
+        Y_minus = [1/Z_minus[ipoint] for ipoint in 1:line_n_quad_points]
+        
+        if boundary_type == ABC::BoundaryConditionType
+            α_abc = 1
+            α = α_abc
+            c1 = -1im * ω .* (μ_minus .* α_abc) ./ (2 .* Z_minus)
+            c2 = Z_minus ./ (2 .* Z_minus)
+
+            Zm = Z_minus[1]
+            Zp = Z_minus[1]
+        elseif boundary_type == PEC::BoundaryConditionType
+            α_pec = 1
+            α = α_pec
+            c1 = -1im * ω .* (μ_minus .* α_pec) ./ Z_minus
+            c2 = 1 .* Z_minus ./ Z_minus
+            Zm = Z_minus[1]
+            Zp = 0
+        elseif boundary_type == PMC::BoundaryConditionType
+            c1 = 0 .* Z_minus
+            c2 = 0 .* Z_minus
+        # elseif boundary_type == IMP::BoundaryConditionType
+        #     Z_plus = boundary.Z
+        #     Y_plus = 1/boundary.Z
+        else
+            @assert(false,"Unknown Boundary Condition Type")
+        end
+
+        #------------------------------------------------
+        # For TM wave equation we need to integrate n dot gradE = -n x curlE = jωμ n x H
+        # = -jωμ (-α/(Z^- + Z^+) n x n x E - Z^-/(Z^- + Z^+) n x H) for one-sided conditions
+        # with n x H = -1/(jωμ) n x curlE = +1/(jωμ) n dot gradE
+        #------------------------------------------------
+
+        # for TM problems we need nx*dBx and ny*dBy
+        for ipoint in 1:line_n_quad_points
+            #jacobian^-T (at a point) * gradient of local basis = gradient in global coordinates (with a transpose or something)?
+            #T = ele_jacobian[:,:,ipoint]'\grad_basis_on_surface[:,:,ipoint,1]
+            T = ele_jacobian[:,:,ipoint]'\grad_basis_on_surface[:,:,ipoint,1]
+
+            nxnxE[:,ipoint] =  c1[ipoint]*B[:,ipoint]
+            nxdBx[:,ipoint] =  c2[ipoint]*nhat[ipoint][1]*T[1,:] #nx*dBx at each point
+            nydBy[:,ipoint] =  c2[ipoint]*nhat[ipoint][2]*T[2,:] #ny*dBy at each point
+
+            dBx[:,ipoint] = T[1,:]
+            dBy[:,ipoint] = T[2,:]
+
+            
+        end
+            
+
+        J = diagm(line_determinant) #diagonal matrix of quad point jacobians for this element
+
+        nx = nhat[1][1]
+        ny = nhat[1][2]
+
+        # calculate Fminus matrix for one-sided boundary conditions
+        #F[:,:,ibd] = B*(J*W)*nxnxE' + B*(J*W)*(nxdBx' + nydBy')
+        F[:,:,ibd] = B*(J*W)*transpose(nxnxE) + B*(J*W)*(transpose(nxdBx) + transpose(nydBy))
+        F2[:,:,ibd] = -1im*ω*μ_minus[1]*α/(Zm + Zp)*(B*(J*W)*B') + Zm/(Zm + Zp)*(nx*B*(J*W)*dBx' + ny*B*(J*W)*dBy')
+
+        @assert(norm(F[:,:,ibd] - F2[:,:,ibd]) < 1e-12)
+        
+        ele_indexes[ibd] = element_index
+
+        # wonder if we should do these for "actual physics" and "background physics" at the same time        
+            
+        # might need some extra stuff for PEC/PMC for scattered field formulations
+    
+    end
+       
+    boundary_flux_matrices = EMTMBoundaryFluxMatrices(F,ele_indexes)
+
+    # println("Mesh perimenter = ", mesh_perimeter)
+
+
+    # gr()
+    
+    # s = scatter(xvec,yvec)
+    # s = quiver!(xvec,yvec,quiver=(nxvec,nyvec))
+
+    # display(s)
+
+    return boundary_flux_matrices
+
+end
+=#
+
+# """
+# Assemble a global mass matrix - FEM TM Problem Type
+
+# M(V)_ij = ∫ coefficients[V] ϕ_i ⋅ ϕ_j dV
+# """
+# function massMatrix(
+#     space::SimpleFunctionSpace{T,F} where {T<:AbstractElement,F<:HOneElement},
+#     ; coefficients::Vector{Tv}=Float64[]) where {Tv<:Number}
+
+#     local_functions = space.local_space.functions
+#     (_, num_functions, num_points, num_orientations) = size(local_functions)
+
+#     # convert to arrays of SVector
+#     local_functions = reinterpret(SVector{3,Float64}, local_functions)
+#     local_functions = reshape(local_functions, (num_functions, num_points, num_orientations))
+
+#     # get quad points and weights
+#     quad_weights = space.local_space.quad_weights
+#     quad_points = space.local_space.quad_points
+
+#     # temporary array to reduce allocations in loop
+#     basis_functions = zeros(SVector{3,Float64}, num_functions, num_points)
+
+#     # coo lists
+#     M_coo = Tv[]
+#     I_coo = Int32[]
+#     J_coo = Int32[]
+
+#     for (t, tag) in enumerate(space.mesh.elements.tags)
+#         # get orientation for this element
+#         orient = 1 + gmsh.model.mesh.getBasisFunctionsOrientationForElement(tag, "HcurlLegendre")
+
+#         # get jacobians for this element, convert to SMatrix
+#         jacobians, determinants, _ = gmsh.model.mesh.getJacobian(tag, quad_points)
+#         jacobians = reinterpret(SMatrix{3,3,Float64,9}, jacobians)
+
+#         for f = 1:num_functions, p = 1:num_points
+#             basis_functions[f, p] = jacobians[p]' \ local_functions[f, p, orient]
+#         end
+
+#         for j = 1:num_functions, i = 1:num_functions
+#             tempM::Tv = 0
+#             for q = 1:num_points
+#                 # brackets on inner product of functions required to get exact symmetry
+#                 tempM += quad_weights[q] * (basis_functions[i, q]' * basis_functions[j, q]) * determinants[q]
+#             end
+
+#             if length(coefficients) > 0
+#                 tempM = tempM * coefficients[t]
+#             end
+
+#             push!(M_coo, tempM)
+#             push!(I_coo, space.dof_map[i, t])
+#             push!(J_coo, space.dof_map[j, t])
+#         end
+#     end
+#     N = maximum(space.dof_map)
+#     M = sparse(I_coo, J_coo, M_coo, N, N)
+#     return M
+# end
